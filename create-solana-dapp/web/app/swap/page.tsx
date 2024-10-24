@@ -4,6 +4,116 @@ import styles from './swap.module.css';
 import { useWallet } from '@solana/wallet-adapter-react';
 import { VersionedTransaction, Connection } from '@solana/web3.js';
 import React, { useState, useEffect, useCallback } from 'react';
+import {
+  BlockhashWithExpiryBlockHeight,
+  TransactionExpiredBlockheightExceededError,
+  VersionedTransactionResponse,
+} from "@solana/web3.js";
+import promiseRetry from "promise-retry";
+
+type TransactionSenderAndConfirmationWaiterArgs = {
+  connection: Connection;
+  serializedTransaction: Buffer;
+  blockhashWithExpiryBlockHeight: BlockhashWithExpiryBlockHeight;
+};
+
+const SEND_OPTIONS = {
+  skipPreflight: true,
+};
+
+export const wait = (time: number) =>
+  new Promise((resolve) => setTimeout(resolve, time));
+
+export async function transactionSenderAndConfirmationWaiter({
+  connection,
+  serializedTransaction,
+  blockhashWithExpiryBlockHeight,
+}: TransactionSenderAndConfirmationWaiterArgs): Promise<VersionedTransactionResponse | null> {
+  const txid = await connection.sendRawTransaction(
+    serializedTransaction,
+    SEND_OPTIONS
+  );
+
+  const controller = new AbortController();
+  const abortSignal = controller.signal;
+
+  const abortableResender = async () => {
+    while (true) {
+      await wait(2_000);
+      if (abortSignal.aborted) return;
+      try {
+        await connection.sendRawTransaction(
+          serializedTransaction,
+          SEND_OPTIONS
+        );
+      } catch (e) {
+        console.warn(`Failed to resend transaction: ${e}`);
+      }
+    }
+  };
+
+  try {
+    abortableResender();
+    const lastValidBlockHeight =
+      blockhashWithExpiryBlockHeight.lastValidBlockHeight - 150;
+
+    // this would throw TransactionExpiredBlockheightExceededError
+    await Promise.race([
+      connection.confirmTransaction(
+        {
+          ...blockhashWithExpiryBlockHeight,
+          lastValidBlockHeight,
+          signature: txid,
+          abortSignal,
+        },
+        "confirmed"
+      ),
+      new Promise(async (resolve) => {
+        // in case ws socket died
+        while (!abortSignal.aborted) {
+          await wait(2_000);
+          const tx = await connection.getSignatureStatus(txid, {
+            searchTransactionHistory: false,
+          });
+          if (tx?.value?.confirmationStatus === "confirmed") {
+            resolve(tx);
+          }
+        }
+      }),
+    ]);
+  } catch (e) {
+    if (e instanceof TransactionExpiredBlockheightExceededError) {
+      // we consume this error and getTransaction would return null
+      return null;
+    } else {
+      // invalid state from web3.js
+      throw e;
+    }
+  } finally {
+    controller.abort();
+  }
+
+  // in case rpc is not synced yet, we add some retries
+  const response = promiseRetry(
+    async (retry) => {
+      const response = await connection.getTransaction(txid, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (!response) {
+        retry(response);
+      }
+      return response;
+    },
+    {
+      retries: 5,
+      minTimeout: 1e3,
+    }
+  );
+
+  return response;
+}
+
 
 const assets = [
   { name: 'SOL', mint: 'So11111111111111111111111111111111111111112', decimals: 9},
@@ -40,7 +150,7 @@ export default function Swap() {
 
   // Need a custom RPC so you don't get rate-limited, don't rely on users' wallets
   const connection = new Connection(
-    'https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY_HERE'
+    'https://mainnet.helius-rpc.com/?api-key=d88d6144-5cf1-4a69-8da4-9fc4df47d3e3'
   );
 
   const handleFromAssetChange = async (
@@ -109,6 +219,11 @@ export default function Swap() {
           quoteResponse,
           userPublicKey: wallet.publicKey?.toString(),
           wrapAndUnwrapSol: true,
+          dynamicComputeUnitLimit: true,
+          maxRetries: 4,
+          prioritizationFeeLamports: {
+         autoMultiplier: 2
+      		},
           // feeAccount is optional. Use if you want to charge a fee.  feeBps must have been passed in /quote API.
           // feeAccount: "fee_account_public_key"
         }),
@@ -127,16 +242,30 @@ export default function Swap() {
       });
 
       const latestBlockHash = await connection.getLatestBlockhash();
-      await connection.confirmTransaction({
-        blockhash: latestBlockHash.blockhash,
-        lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
-        signature: txid
-      }, 'confirmed');
+     // await connection.confirmTransaction({
+     //   blockhash: latestBlockHash.blockhash,
+     //   lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
+     //   signature: txid
+     // }, 'confirmed');
       
-      console.log(`https://solscan.io/tx/${txid}`);
+      // Use transactionSenderAndConfirmationWaiter function for sending and confirming
+	const result = await transactionSenderAndConfirmationWaiter({
+	  connection,
+	  serializedTransaction: rawTransaction,
+	  blockhashWithExpiryBlockHeight: {
+	    blockhash: latestBlockHash.blockhash,
+	    lastValidBlockHeight: latestBlockHash.lastValidBlockHeight,
+	  },
+	});
+
+	if (result) {
+	  console.log(`Transaction confirmed with response:`, result);
+	} else {
+	  console.log('Transaction expired or could not be confirmed. ',result);
+	}
 
     } catch (error) {
-      console.error('Error signing or sending the transaction:', error);
+      console.log('Error signing or sending the transaction:', error);
     }
   }
 
